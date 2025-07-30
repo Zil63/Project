@@ -1,0 +1,186 @@
+---
+- name: Setup Docker, Firewall, Monitoring and Backups
+  hosts: all
+  become: true
+  gather_facts: true
+
+  tasks:
+
+    # ----------------------------
+    # Docker installation
+    # ----------------------------
+    - name: Remove all incorrect Docker repo files
+      ansible.builtin.find:
+        paths: /etc/apt/sources.list.d
+        patterns: '*docker*.list'
+      register: docker_repo_files
+
+    - name: Delete incorrect Docker repo files
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ docker_repo_files.files }}"
+      when: docker_repo_files.matched > 0
+
+    - name: Create keyrings directory if not exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Download Docker GPG key and convert
+      ansible.builtin.shell:
+        cmd: curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+      args:
+        creates: /etc/apt/keyrings/docker.gpg
+
+    - name: Add Docker APT repository for Ubuntu
+      ansible.builtin.apt_repository:
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        filename: docker
+        state: present
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+
+    - name: Install required packages
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - software-properties-common
+          - mc
+          - nano
+          - net-tools
+        state: present
+
+    - name: Install Docker
+      ansible.builtin.apt:
+        name: docker-ce
+        state: present
+
+    - name: Add 'vagrant' user to 'docker' group
+      ansible.builtin.user:
+        name: vagrant
+        groups: docker
+        append: yes
+
+    - name: Install docker-compose
+      ansible.builtin.get_url:
+        url: https://github.com/docker/compose/releases/download/1.25.1-rc1/docker-compose-Linux-x86_64
+        dest: /usr/local/bin/docker-compose
+        mode: '0755'
+
+    # ----------------------------
+    # Копирование проекта
+    # ----------------------------
+    - name: Copy project directory
+      ansible.builtin.copy:
+        src: project
+        dest: /home/vagrant/
+        mode: '0777'
+        owner: vagrant
+        group: vagrant
+
+    - name: Reset SSH connection
+      meta: reset_connection
+
+    # ----------------------------
+    # DynamicWeb-specific tasks
+    # ----------------------------
+    - name: Stop and remove old containers
+      ansible.builtin.shell:
+        cmd: docker-compose -f docker-compose.yml down --remove-orphans
+        chdir: /home/vagrant/project
+      when: ansible_hostname == "DynamicWeb"
+
+    - name: Start DynamicWeb containers
+      ansible.builtin.shell:
+        cmd: docker-compose -f docker-compose.yml up -d
+        chdir: /home/vagrant/project
+      when: ansible_hostname == "DynamicWeb"
+
+    - name: Run MySQL group replication script
+      ansible.builtin.shell:
+        cmd: bash ./travis-ci/create_gr.sh
+        chdir: /home/vagrant/project
+      when: ansible_hostname == "DynamicWeb"
+
+    - name: Disable and stop ufw service
+      ansible.builtin.systemd:
+        name: ufw
+        enabled: false
+        state: stopped
+        daemon_reload: yes
+      when: ansible_hostname == "DynamicWeb"
+
+    - name: Install iptables and iptables-persistent
+      ansible.builtin.apt:
+        name:
+          - iptables
+          - iptables-persistent
+        state: present
+        update_cache: true
+      when: ansible_hostname == "DynamicWeb"
+
+    - name: Enable iptables service
+      ansible.builtin.service:
+        name: iptables
+        state: started
+        enabled: true
+      when: ansible_hostname == "DynamicWeb"
+
+    - name: Restrict all external connections except 10.0.2.2
+      ansible.builtin.shell: iptables -I DOCKER-USER -i eth0 ! -s 10.0.2.2 -j DROP
+      when: ansible_hostname == "DynamicWeb"
+
+    - name: Save iptables rules
+      ansible.builtin.shell: iptables-save > /etc/iptables/rules.v4
+      when: ansible_hostname == "DynamicWeb"
+
+    - name: Make SQL dump script executable
+      ansible.builtin.file:
+        path: /home/vagrant/project/dumpSQL.sh
+        mode: '0755'
+      when: ansible_hostname == "DynamicWeb"
+
+    - name: Set PATH for cron
+      ansible.builtin.cron:
+        name: PATH
+        env: true
+        job: /usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+      when: ansible_hostname == "DynamicWeb"
+
+    - name: Create cronjob for SQL dump
+      ansible.builtin.cron:
+        name: "dumpSQL"
+        state: present
+        minute: "0"
+        hour: "3"
+        job: "/home/vagrant/project/dumpSQL.sh"
+      when: ansible_hostname == "DynamicWeb"
+
+    # ----------------------------
+    # Monitoring-specific tasks
+    # ----------------------------
+    - name: Start Monitoring stack
+      ansible.builtin.shell:
+        cmd: docker-compose -f docker-compose.yml up -d
+        chdir: /home/vagrant/project/prometheus
+      when: ansible_hostname == "Monitoring"
+
+    - name: Template rsyslog.conf
+      ansible.builtin.copy:
+        src: ./project/nginx-conf/rsyslog.conf
+        dest: /etc/rsyslog.conf
+      notify: restart rsyslog
+      when: ansible_hostname == "Monitoring"
+
+  handlers:
+    - name: restart rsyslog
+      ansible.builtin.systemd:
+        name: rsyslog
+        state: restarted
+        enabled: true
